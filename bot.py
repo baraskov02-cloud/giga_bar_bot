@@ -1,4 +1,3 @@
-import os
 import logging
 import asyncio
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -8,11 +7,9 @@ from telegram.ext import (
 )
 import database as db
 
-# === Переменные окружения ===
-TOKEN = os.environ.get("BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("BOT_TOKEN не задан в переменных окружения")
-ADMIN_ID = int(os.environ.get("ADMIN_ID", 6665494648))
+# === ТОКЕН В КОДЕ ===
+TOKEN = "8657499967:AAFq4WDXDCMCHyABu5Y7AeXMWSc8q7yZVQA"
+ADMIN_ID = 6665494648
 COMMISSION = 5
 
 # === USSD-инструкции для операторов ===
@@ -72,7 +69,39 @@ async def start(update, context):
     if db.is_blacklisted(user.id):
         await update.message.reply_text("⛔ Вы в чёрном списке. Обратитесь к администратору.")
         return
+    # Если нет телефона и оператора, предложим ввести
+    if not db.get_user(user.id)['phone']:
+        await update.message.reply_text(
+            "Добро пожаловать в GIGA BAR!\n"
+            "Сначала отправьте номер телефона: /set_phone\n"
+            "Затем укажите оператора: /set_operator МТС / Билайн / Мегафон / Tele2 / Yota"
+        )
+        return
     await main_menu(update, user.id, message=update.message)
+
+async def set_phone(update, context):
+    await update.message.reply_text("Введите ваш номер телефона (пример: 79123456789):")
+    return 1
+
+async def receive_phone(update, context):
+    phone = update.message.text.strip()
+    if not phone.isdigit() or len(phone) < 10:
+        await update.message.reply_text("Неверный формат. Пример: 79123456789")
+        return 1
+    context.user_data['phone'] = phone
+    await update.message.reply_text("Теперь введите оператора (МТС, Билайн, Мегафон, Tele2, Yota):")
+    return 2
+
+async def receive_operator(update, context):
+    op = update.message.text.strip()
+    if op not in ['МТС', 'Билайн', 'Мегафон', 'Tele2', 'Yota']:
+        await update.message.reply_text("Неверный оператор. Введите: МТС, Билайн, Мегафон, Tele2, Yota")
+        return 2
+    uid = update.effective_user.id
+    db.update_user_phone(uid, context.user_data['phone'], op)
+    await update.message.reply_text(f"✅ Номер {context.user_data['phone']} и оператор {op} сохранены.")
+    await main_menu(update, uid, message=update.message)
+    return ConversationHandler.END
 
 # ----- Баланс и гиги -----
 async def balance_callback(update, context):
@@ -125,12 +154,12 @@ async def sell_price(update, context):
         await update.message.reply_text(f"У вас только {fmt(user['gigs'])} ГБ. Пополните гиги у админа.")
         return ConversationHandler.END
     if not user['operator']:
-        await update.message.reply_text("Сначала укажите оператора в /start.")
+        await update.message.reply_text("Сначала укажите оператора через /set_operator")
         return ConversationHandler.END
     db.update_gigs(uid, -amount)
     oid = db.add_offer(uid, amount, price, user['operator'])
     await update.message.reply_text(f"✅ Объявление #{oid} создано!\n{amount} ГБ по {price} руб/ГБ, итого {fmt(total)} руб")
-    # Уведомить подписчиков на этого оператора
+    # Уведомить подписчиков
     subscribers = db.get_subscribers_by_operator(user['operator'])
     for sub in subscribers:
         if sub != uid:
@@ -173,10 +202,9 @@ async def buy_offer_cmd(update, context):
         return
     buyer = db.get_user(buyer_id)
     if buyer['balance'] < offer['total_price']:
-        await update.message.reply_text(f"Не хватает {fmt(offer['total_price'])} руб. Пополните баланс.")
+        await update.message.reply_text(f"Не хватает {fmt(offer['total_price'])} руб. Пополните баланс (демо: /top_up 500).")
         return
     seller = db.get_user(offer['seller_id'])
-    # Проверяем, не заблокирован ли продавец
     if db.is_blacklisted(offer['seller_id']):
         await update.message.reply_text("Продавец в чёрном списке, сделка невозможна.")
         return
@@ -186,11 +214,9 @@ async def buy_offer_cmd(update, context):
     db.update_balance(buyer_id, -offer['total_price'])
     db.delete_offer(oid)
 
-    # Формируем USSD-команду для продавца
     ussd = USSD_TEMPLATES.get(seller['operator'], "Передача через приложение оператора")
     ussd_command = ussd.format(phone=buyer['phone'], amount=int(offer['amount'])) if '{phone}' in ussd else ussd
 
-    # Уведомление продавца
     await context.bot.send_message(
         offer['seller_id'],
         f"🔔 *Новая сделка #{txn_id}*\n"
@@ -203,16 +229,15 @@ async def buy_offer_cmd(update, context):
         f"После отправки USSD-команды нажмите /confirm_send {txn_id}",
         parse_mode='Markdown'
     )
-    # Уведомление покупателя
     await update.message.reply_text(
         f"✅ Вы купили {offer['amount']} ГБ.\n"
-        f"Деньги зарезервированы. Продавец свяжется с вами для передачи.\n"
+        f"Деньги зарезервированы. Продавец передаст гиги.\n"
         f"Когда получите гиги, подтвердите: /confirm_receive {txn_id}\n\n"
         f"📞 Ваш номер: `{buyer['phone']}` (оператор {buyer['operator']})",
         parse_mode='Markdown'
     )
 
-# ----- Подтверждение сделок -----
+# ----- Подтверждение -----
 async def confirm_send_cmd(update, context):
     if not context.args:
         await update.message.reply_text("/confirm_send [ID сделки]")
@@ -262,8 +287,6 @@ async def confirm_receive_cmd(update, context):
             f"💰 {fmt(txn_data['total_amount'] - txn_data['commission'])} руб зачислены на ваш баланс."
         )
         await update.message.reply_text("✅ Сделка завершена! Спасибо.\nОцените продавца: /rate_seller [ID сделки] [1-5]")
-        # Предложить оценку
-        await update.message.reply_text("Вы можете оценить продавца: /rate_seller {txn} 5".format(txn=txn))
     else:
         await update.message.reply_text("✅ Получение подтверждено. Ждём подтверждения от продавца.")
 
@@ -285,7 +308,6 @@ async def rate_seller(update, context):
     if not txn_data or txn_data['buyer_id'] != uid or txn_data['status'] != 'completed':
         await update.message.reply_text("Сделка не найдена или ещё не завершена.")
         return
-    # Проверяем, не оценивал ли уже
     db.add_rating(uid, txn_data['seller_id'], txn, rating, "")
     await update.message.reply_text("Спасибо за оценку!")
 
@@ -307,15 +329,11 @@ async def dispute(update, context):
     db.update_transaction_confirmation(txn, dispute=1)
     await context.bot.send_message(
         ADMIN_ID,
-        f"⚠️ Спор по сделке #{txn}\n"
-        f"Покупатель: {txn_data['buyer_id']}\n"
-        f"Продавец: {txn_data['seller_id']}\n"
-        f"Сумма: {fmt(txn_data['total_amount'])} руб\n"
-        f"Админ, решите вручную."
+        f"⚠️ Спор по сделке #{txn}\nПокупатель: {txn_data['buyer_id']}\nПродавец: {txn_data['seller_id']}\nСумма: {fmt(txn_data['total_amount'])} руб\nАдмин, решите вручную."
     )
     await update.message.reply_text("Жалоба отправлена администратору.")
 
-# ----- Подписка на оператора -----
+# ----- Подписка -----
 async def subscribe_menu(update, context):
     q = update.callback_query
     await q.answer()
@@ -370,7 +388,6 @@ async def my_deals(update, context):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    # Показываем завершённые сделки
     conn = sqlite3.connect('giga.db')
     c = conn.cursor()
     c.execute("SELECT txn_id, amount, total_amount, status, timestamp FROM transactions WHERE (buyer_id = ? OR seller_id = ?) ORDER BY timestamp DESC LIMIT 10", (uid, uid))
@@ -542,27 +559,20 @@ async def decline_withdraw(update, context):
         await update.message.reply_text(f"Заявка #{rid} отклонена.")
     except: pass
 
-# ----- Запуск -----
+# ----- ЗАПУСК -----
 def main():
     app = Application.builder().token(TOKEN).build()
 
-    # Регистрация команд
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("top_up", top_up_demo))
-    app.add_handler(CommandHandler("buy_offer", buy_offer_cmd))
-    app.add_handler(CommandHandler("cancel_offer", cancel_offer_cmd))
-    app.add_handler(CommandHandler("confirm_send", confirm_send_cmd))
-    app.add_handler(CommandHandler("confirm_receive", confirm_receive_cmd))
-    app.add_handler(CommandHandler("rate_seller", rate_seller))
-    app.add_handler(CommandHandler("dispute", dispute))
-    app.add_handler(CommandHandler("block_user", block_user))
-    app.add_handler(CommandHandler("unblock_user", unblock_user))
-    app.add_handler(CommandHandler("admin_add_balance", admin_add_balance_cmd))
-    app.add_handler(CommandHandler("admin_add_gigs", admin_add_gigs_cmd))
-    app.add_handler(CommandHandler("approve_withdraw", approve_withdraw))
-    app.add_handler(CommandHandler("decline_withdraw", decline_withdraw))
-
-    # Продажа (Conversation)
+    # Разговор для установки номера и оператора
+    conv_setup = ConversationHandler(
+        entry_points=[CommandHandler("set_phone", set_phone)],
+        states={
+            1: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_phone)],
+            2: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_operator)],
+        },
+        fallbacks=[],
+    )
+    # Продажа
     sell_conv = ConversationHandler(
         entry_points=[CallbackQueryHandler(sell_menu, pattern='^sell_menu$')],
         states={
@@ -580,10 +590,25 @@ def main():
         },
         fallbacks=[],
     )
+    app.add_handler(conv_setup)
     app.add_handler(sell_conv)
     app.add_handler(withdraw_conv)
 
-    # Callback'и
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("top_up", top_up_demo))
+    app.add_handler(CommandHandler("buy_offer", buy_offer_cmd))
+    app.add_handler(CommandHandler("cancel_offer", cancel_offer_cmd))
+    app.add_handler(CommandHandler("confirm_send", confirm_send_cmd))
+    app.add_handler(CommandHandler("confirm_receive", confirm_receive_cmd))
+    app.add_handler(CommandHandler("rate_seller", rate_seller))
+    app.add_handler(CommandHandler("dispute", dispute))
+    app.add_handler(CommandHandler("block_user", block_user))
+    app.add_handler(CommandHandler("unblock_user", unblock_user))
+    app.add_handler(CommandHandler("admin_add_balance", admin_add_balance_cmd))
+    app.add_handler(CommandHandler("admin_add_gigs", admin_add_gigs_cmd))
+    app.add_handler(CommandHandler("approve_withdraw", approve_withdraw))
+    app.add_handler(CommandHandler("decline_withdraw", decline_withdraw))
+
     app.add_handler(CallbackQueryHandler(balance_callback, pattern='^balance$'))
     app.add_handler(CallbackQueryHandler(my_gigs_callback, pattern='^my_gigs$'))
     app.add_handler(CallbackQueryHandler(buy_list, pattern='^buy_list$'))
@@ -596,7 +621,7 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_stats, pattern='^admin_stats$'))
     app.add_handler(CallbackQueryHandler(admin_blacklist, pattern='^admin_blacklist$'))
     app.add_handler(CallbackQueryHandler(admin_withdraws, pattern='^admin_withdraws$'))
-    # Заглушки для кнопок-заглушек
+    # заглушки
     app.add_handler(CallbackQueryHandler(lambda u,c: u.callback_query.answer(), pattern='^admin_add_balance$'))
     app.add_handler(CallbackQueryHandler(lambda u,c: u.callback_query.answer(), pattern='^admin_add_gigs$'))
 
