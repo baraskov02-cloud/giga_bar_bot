@@ -1,207 +1,353 @@
+import os
 import logging
 import asyncio
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
-    Application, CommandHandler, MessageHandler, filters,
-    CallbackQueryHandler, ContextTypes, ConversationHandler
+    Application, CommandHandler, CallbackQueryHandler, ContextTypes,
+    ConversationHandler, MessageHandler, filters
 )
 import database as db
 
-TOKEN = "8657499967:AAFq4WDXDCMCHyABu5Y7AeXMWSc8q7yZVQA"
-ADMIN_ID = 6665494648
-COMMISSION_PERCENT = 5.0
-MAX_GB_PER_TRADE = 100
-OPERATORS = ['МТС', 'Билайн', 'Мегафон', 'Tele2', 'Yota']
+# === Переменные окружения ===
+TOKEN = os.environ.get("BOT_TOKEN")
+if not TOKEN:
+    raise ValueError("BOT_TOKEN не задан в переменных окружения")
+ADMIN_ID = int(os.environ.get("ADMIN_ID", 6665494648))
+COMMISSION = 5
 
-PHONE, OPERATOR, SELL_AMOUNT, SELL_PRICE, SELL_OPERATOR = range(5)
+# === USSD-инструкции для операторов ===
+USSD_TEMPLATES = {
+    "МТС": "*111*511*{phone}*{amount}#",
+    "Билайн": "*112*{phone}*{amount}#",
+    "Мегафон": "*105*{phone}*{amount}#",
+    "Tele2": "*203*{phone}*{amount}#",
+    "Yota": "В приложении Yota: передача гигов через профиль"
+}
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
 
 db.init_db()
 
-def fmt(n):
-    return f"{n:.2f}"
+def fmt(n): return f"{n:.2f}"
 
-async def main_menu(message, user_id):
+def get_rating_text(user_id):
+    rating = db.get_avg_rating(user_id)
+    if rating == 0:
+        return "⭐️ нет оценок"
+    stars = "⭐" * round(rating)
+    return f"{stars} ({fmt(rating)})"
+
+# ========== ГЛАВНОЕ МЕНЮ ==========
+async def main_menu(update, user_id, message=None, edit=False):
     user = db.get_user(user_id)
-    keyboard = [
-        [InlineKeyboardButton("💰 Баланс", callback_data='balance')],
-        [InlineKeyboardButton("📦 Продать гиги", callback_data='sell_menu')],
-        [InlineKeyboardButton("🛒 Купить гиги", callback_data='buy')],
-        [InlineKeyboardButton("📋 Мои объявления", callback_data='my_offers')],
-        [InlineKeyboardButton("✅ Подтвердить сделку", callback_data='confirm_menu')],
-        [InlineKeyboardButton("⚙️ Настройки", callback_data='settings')],
-    ]
+    text = (f"🏪 *GIGA BAR — Безопасный обмен гигабайтами*\n\n"
+            f"💰 Баланс: `{fmt(user['balance'])}` руб\n"
+            f"📦 Гиги: `{fmt(user['gigs'])}` ГБ\n"
+            f"📱 Оператор: `{user['operator'] or '—'}`\n"
+            f"⭐ Рейтинг: {get_rating_text(user_id)}\n\n"
+            f"💸 Комиссия: {COMMISSION}%")
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("💰 Баланс", callback_data='balance'),
+         InlineKeyboardButton("📦 Мои гиги", callback_data='my_gigs')],
+        [InlineKeyboardButton("📦 Продать гиги", callback_data='sell_menu'),
+         InlineKeyboardButton("🛒 Купить гиги", callback_data='buy_list')],
+        [InlineKeyboardButton("📋 Мои объявления", callback_data='my_offers'),
+         InlineKeyboardButton("🤝 Мои сделки", callback_data='my_deals')],
+        [InlineKeyboardButton("💳 Пополнить баланс", callback_data='deposit'),
+         InlineKeyboardButton("💸 Вывести деньги", callback_data='withdraw_start')],
+        [InlineKeyboardButton("🔔 Подписка на оператора", callback_data='subscribe')],
+    ])
     if user['user_id'] == ADMIN_ID:
-        keyboard.append([InlineKeyboardButton("👑 Админ", callback_data='admin_panel')])
+        kb.inline_keyboard.append([InlineKeyboardButton("👑 Админ", callback_data='admin_menu')])
+    if edit and message:
+        await message.edit_text(text, reply_markup=kb, parse_mode='Markdown')
+    elif message:
+        await message.reply_text(text, reply_markup=kb, parse_mode='Markdown')
+    else:
+        await update.effective_message.reply_text(text, reply_markup=kb, parse_mode='Markdown')
 
-    await message.reply_text(
-        f"🏪 *GIGA BAR*\n\n"
-        f"💰 Баланс: `{fmt(user['balance'])}` руб\n"
-        f"📦 Гиги: `{fmt(user['gigs'])}` ГБ\n"
-        f"📱 Телефон: `{user['phone'] or '—'}`\n"
-        f"📡 Оператор: `{user['operator'] or '—'}`\n\n"
-        f"💸 Комиссия: {COMMISSION_PERCENT}%",
-        reply_markup=keyboard,
-        parse_mode="Markdown"
-    )
-
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def start(update, context):
     user = update.effective_user
     db.register_user(user.id, user.username)
+    if db.is_blacklisted(user.id):
+        await update.message.reply_text("⛔ Вы в чёрном списке. Обратитесь к администратору.")
+        return
+    await main_menu(update, user.id, message=update.message)
 
-    if not db.get_user(user.id)['phone']:
-        btn = ReplyKeyboardMarkup(
-            [[KeyboardButton("📱 Отправить номер", request_contact=True)]],
-            resize_keyboard=True
-        )
-        await update.message.reply_text(
-            f"Привет, {user.first_name}!\nНажми кнопку, чтобы указать номер.",
-            reply_markup=btn
-        )
-        return PHONE
-
-    await main_menu(update.message, user.id)
-    return ConversationHandler.END
-
-async def receive_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    contact = update.message.contact
-    if not contact:
-        await update.message.reply_text("Используйте кнопку.")
-        return PHONE
-    db.update_user_phone(update.effective_user.id, contact.phone_number, None)
-    await update.message.reply_text(
-        "Выберите оператора:",
-        reply_markup=ReplyKeyboardMarkup([[op for op in OPERATORS]], resize_keyboard=True)
-    )
-    return OPERATOR
-
-async def receive_operator_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    op = update.message.text
-    if op not in OPERATORS:
-        await update.message.reply_text(f"Выберите из: {', '.join(OPERATORS)}")
-        return OPERATOR
-    uid = update.effective_user.id
-    user = db.get_user(uid)
-    db.update_user_phone(uid, user['phone'], op)
-    await update.message.reply_text(f"✅ Оператор {op} сохранён.", reply_markup=ReplyKeyboardMarkup([[]], resize_keyboard=True))
-    await main_menu(update.message, uid)
-    return ConversationHandler.END
-
-async def balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ----- Баланс и гиги -----
+async def balance_callback(update, context):
     q = update.callback_query
     await q.answer()
     u = db.get_user(q.from_user.id)
-    await q.edit_message_text(f"💰 Баланс: {fmt(u['balance'])} руб\n📦 Гиги: {fmt(u['gigs'])} ГБ")
+    await q.edit_message_text(f"💰 Ваш баланс: {fmt(u['balance'])} руб")
 
-async def sell_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def my_gigs_callback(update, context):
     q = update.callback_query
     await q.answer()
+    u = db.get_user(q.from_user.id)
+    await q.edit_message_text(f"📦 Ваши гиги: {fmt(u['gigs'])} ГБ")
+
+# ----- Продажа -----
+async def sell_menu(update, context):
+    q = update.callback_query
+    await q.answer()
+    if db.is_blacklisted(q.from_user.id):
+        await q.edit_message_text("⛔ Вы в чёрном списке и не можете продавать.")
+        return
     await q.edit_message_text("📦 Введите количество ГБ (до 100):")
-    return SELL_AMOUNT
+    return 1
 
-async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sell_amount(update, context):
     try:
-        a = float(update.message.text)
-        if a <= 0 or a > MAX_GB_PER_TRADE:
+        amount = float(update.message.text)
+        if amount <= 0 or amount > 100:
             raise ValueError
     except:
-        await update.message.reply_text(f"Число от 1 до {MAX_GB_PER_TRADE}")
-        return SELL_AMOUNT
-    context.user_data['amount'] = a
-    await update.message.reply_text("💰 Цена за 1 ГБ (руб):")
-    return SELL_PRICE
+        await update.message.reply_text("Введите число от 1 до 100")
+        return 1
+    context.user_data['amount'] = amount
+    await update.message.reply_text("💰 Введите цену за 1 ГБ (руб):")
+    return 2
 
-async def sell_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def sell_price(update, context):
     try:
-        p = float(update.message.text)
-        if p <= 0:
+        price = float(update.message.text)
+        if price <= 0:
             raise ValueError
     except:
-        await update.message.reply_text("Введите положительное число")
-        return SELL_PRICE
-    context.user_data['price'] = p
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton(op, callback_data=f'sell_op_{op}') for op in OPERATORS]])
-    await update.message.reply_text("Выберите оператора:", reply_markup=kb)
-    return SELL_OPERATOR
-
-async def sell_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    q = update.callback_query
-    await q.answer()
-    op = q.data.replace('sell_op_', '')
-    uid = q.from_user.id
-    a = context.user_data['amount']
-    p = context.user_data['price']
+        await update.message.reply_text("Цена должна быть >0")
+        return 2
+    uid = update.effective_user.id
+    amount = context.user_data['amount']
+    total = amount * price
     user = db.get_user(uid)
-    if user['gigs'] < a:
-        await q.edit_message_text(f"У вас только {fmt(user['gigs'])} ГБ")
+    if user['gigs'] < amount:
+        await update.message.reply_text(f"У вас только {fmt(user['gigs'])} ГБ. Пополните гиги у админа.")
         return ConversationHandler.END
-    db.update_gigs(uid, -a)
-    oid = db.add_offer(uid, a, p, op)
-    await q.edit_message_text(f"✅ Объявление #{oid}: {a} ГБ по {p} руб/ГБ")
+    if not user['operator']:
+        await update.message.reply_text("Сначала укажите оператора в /start.")
+        return ConversationHandler.END
+    db.update_gigs(uid, -amount)
+    oid = db.add_offer(uid, amount, price, user['operator'])
+    await update.message.reply_text(f"✅ Объявление #{oid} создано!\n{amount} ГБ по {price} руб/ГБ, итого {fmt(total)} руб")
+    # Уведомить подписчиков на этого оператора
+    subscribers = db.get_subscribers_by_operator(user['operator'])
+    for sub in subscribers:
+        if sub != uid:
+            await context.bot.send_message(sub, f"🔔 Новое объявление от @{user['username']}: {amount} ГБ, {price} руб/ГБ, /buy_offer {oid}")
     return ConversationHandler.END
 
-async def buy_list(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ----- Покупка -----
+async def buy_list(update, context):
     q = update.callback_query
     await q.answer()
     offers = db.get_active_offers()
     if not offers:
-        await q.edit_message_text("Нет активных объявлений")
+        await q.edit_message_text("Нет активных объявлений.")
         return
     text = "📦 *Доступные объявления:*\n"
     for o in offers:
-        text += f"#{o['offer_id']}: {o['amount']} ГБ × {o['price_per_gb']} руб = {fmt(o['total_price'])} руб | {o['operator']}\n"
-    text += "\nКупить: `/buy_offer [ID]`"
-    await q.edit_message_text(text, parse_mode="Markdown")
+        seller = db.get_user(o['seller_id'])
+        if seller:
+            rating = get_rating_text(o['seller_id'])
+            text += f"#{o['offer_id']}: {o['amount']} ГБ × {o['price_per_gb']} руб = {fmt(o['total_price'])} руб | {o['operator']} | Продавец: {rating}\n"
+    text += "\nКупить: /buy_offer [ID]"
+    await q.edit_message_text(text, parse_mode='Markdown')
 
-async def buy_offer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def buy_offer_cmd(update, context):
+    if db.is_blacklisted(update.effective_user.id):
+        await update.message.reply_text("⛔ Вы в чёрном списке и не можете покупать.")
+        return
     if not context.args:
-        await update.message.reply_text("Пример: /buy_offer 1")
+        await update.message.reply_text("/buy_offer [ID]")
         return
     try:
         oid = int(context.args[0])
     except:
-        await update.message.reply_text("ID должно быть числом")
+        await update.message.reply_text("ID должен быть числом")
         return
-    buyer = update.effective_user.id
+    buyer_id = update.effective_user.id
     offer = db.get_offer_by_id(oid)
     if not offer:
         await update.message.reply_text("Объявление не найдено")
         return
-    buyer_data = db.get_user(buyer)
-    if not buyer_data['phone']:
-        await update.message.reply_text("Сначала /start и укажите номер")
+    buyer = db.get_user(buyer_id)
+    if buyer['balance'] < offer['total_price']:
+        await update.message.reply_text(f"Не хватает {fmt(offer['total_price'])} руб. Пополните баланс.")
         return
-    if buyer_data['balance'] < offer['total_price']:
-        await update.message.reply_text(f"Не хватает {fmt(offer['total_price'])} руб. /top_up")
+    seller = db.get_user(offer['seller_id'])
+    # Проверяем, не заблокирован ли продавец
+    if db.is_blacklisted(offer['seller_id']):
+        await update.message.reply_text("Продавец в чёрном списке, сделка невозможна.")
         return
-    commission = offer['total_price'] * COMMISSION_PERCENT / 100
-    tx = db.add_transaction(buyer, offer['seller_id'], offer['amount'], offer['price_per_gb'], offer['total_price'], commission)
-    db.update_balance(buyer, -offer['total_price'])
+
+    commission = offer['total_price'] * COMMISSION / 100
+    txn_id = db.add_transaction(buyer_id, offer['seller_id'], offer['amount'], offer['price_per_gb'], offer['total_price'], commission)
+    db.update_balance(buyer_id, -offer['total_price'])
     db.delete_offer(oid)
+
+    # Формируем USSD-команду для продавца
+    ussd = USSD_TEMPLATES.get(seller['operator'], "Передача через приложение оператора")
+    ussd_command = ussd.format(phone=buyer['phone'], amount=int(offer['amount'])) if '{phone}' in ussd else ussd
+
+    # Уведомление продавца
     await context.bot.send_message(
         offer['seller_id'],
-        f"🔔 Сделка #{tx}!\nПередайте {offer['amount']} ГБ на {buyer_data['phone']}\nПосле отправки: /confirm_send {tx}"
+        f"🔔 *Новая сделка #{txn_id}*\n"
+        f"Покупатель: @{buyer['username']}\n"
+        f"Объём: {offer['amount']} ГБ\n"
+        f"Сумма: {fmt(offer['total_price'])} руб\n"
+        f"Телефон покупателя: `{buyer['phone']}`\n\n"
+        f"📲 *Инструкция для передачи гигов:*\n"
+        f"```\n{ussd_command}\n```\n"
+        f"После отправки USSD-команды нажмите /confirm_send {txn_id}",
+        parse_mode='Markdown'
     )
-    await update.message.reply_text(f"✅ Куплено {offer['amount']} ГБ\nПосле получения: /confirm_receive {tx}")
+    # Уведомление покупателя
+    await update.message.reply_text(
+        f"✅ Вы купили {offer['amount']} ГБ.\n"
+        f"Деньги зарезервированы. Продавец свяжется с вами для передачи.\n"
+        f"Когда получите гиги, подтвердите: /confirm_receive {txn_id}\n\n"
+        f"📞 Ваш номер: `{buyer['phone']}` (оператор {buyer['operator']})",
+        parse_mode='Markdown'
+    )
 
-async def my_offers_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ----- Подтверждение сделок -----
+async def confirm_send_cmd(update, context):
+    if not context.args:
+        await update.message.reply_text("/confirm_send [ID сделки]")
+        return
+    try:
+        txn = int(context.args[0])
+    except:
+        await update.message.reply_text("ID числом")
+        return
+    uid = update.effective_user.id
+    txn_data = db.get_transaction(txn)
+    if not txn_data or txn_data['seller_id'] != uid or txn_data['seller_confirmed']:
+        await update.message.reply_text("Не найдено или уже подтверждено")
+        return
+    db.update_transaction_confirmation(txn, seller_confirmed=1)
+    buyer = db.get_user(txn_data['buyer_id'])
+    await context.bot.send_message(
+        txn_data['buyer_id'],
+        f"🔔 Продавец подтвердил отправку {txn_data['amount']} ГБ.\n"
+        f"Проверьте баланс телефона. Если гиги пришли, нажмите /confirm_receive {txn}\n"
+        f"Если не пришли — /dispute {txn}"
+    )
+    await update.message.reply_text("✅ Отправка подтверждена. Ожидаем подтверждения покупателя.")
+
+async def confirm_receive_cmd(update, context):
+    if not context.args:
+        await update.message.reply_text("/confirm_receive [ID сделки]")
+        return
+    try:
+        txn = int(context.args[0])
+    except:
+        await update.message.reply_text("ID числом")
+        return
+    uid = update.effective_user.id
+    txn_data = db.get_transaction(txn)
+    if not txn_data or txn_data['buyer_id'] != uid or txn_data['buyer_confirmed']:
+        await update.message.reply_text("Не найдено или уже подтверждено")
+        return
+    db.update_transaction_confirmation(txn, buyer_confirmed=1)
+    txn_data = db.get_transaction(txn)
+    if txn_data['seller_confirmed']:
+        db.complete_transaction(txn)
+        seller = db.get_user(txn_data['seller_id'])
+        await context.bot.send_message(
+            txn_data['seller_id'],
+            f"✅ Покупатель подтвердил получение {txn_data['amount']} ГБ.\n"
+            f"💰 {fmt(txn_data['total_amount'] - txn_data['commission'])} руб зачислены на ваш баланс."
+        )
+        await update.message.reply_text("✅ Сделка завершена! Спасибо.\nОцените продавца: /rate_seller [ID сделки] [1-5]")
+        # Предложить оценку
+        await update.message.reply_text("Вы можете оценить продавца: /rate_seller {txn} 5".format(txn=txn))
+    else:
+        await update.message.reply_text("✅ Получение подтверждено. Ждём подтверждения от продавца.")
+
+# ----- Оценка -----
+async def rate_seller(update, context):
+    if len(context.args) != 2:
+        await update.message.reply_text("/rate_seller [ID сделки] [1-5]")
+        return
+    try:
+        txn = int(context.args[0])
+        rating = int(context.args[1])
+        if rating < 1 or rating > 5:
+            raise ValueError
+    except:
+        await update.message.reply_text("ID сделки и оценка 1-5")
+        return
+    uid = update.effective_user.id
+    txn_data = db.get_transaction(txn)
+    if not txn_data or txn_data['buyer_id'] != uid or txn_data['status'] != 'completed':
+        await update.message.reply_text("Сделка не найдена или ещё не завершена.")
+        return
+    # Проверяем, не оценивал ли уже
+    db.add_rating(uid, txn_data['seller_id'], txn, rating, "")
+    await update.message.reply_text("Спасибо за оценку!")
+
+# ----- Спор -----
+async def dispute(update, context):
+    if not context.args:
+        await update.message.reply_text("/dispute [ID сделки]")
+        return
+    try:
+        txn = int(context.args[0])
+    except:
+        await update.message.reply_text("ID числом")
+        return
+    uid = update.effective_user.id
+    txn_data = db.get_transaction(txn)
+    if not txn_data or (txn_data['buyer_id'] != uid and txn_data['seller_id'] != uid):
+        await update.message.reply_text("Сделка не найдена")
+        return
+    db.update_transaction_confirmation(txn, dispute=1)
+    await context.bot.send_message(
+        ADMIN_ID,
+        f"⚠️ Спор по сделке #{txn}\n"
+        f"Покупатель: {txn_data['buyer_id']}\n"
+        f"Продавец: {txn_data['seller_id']}\n"
+        f"Сумма: {fmt(txn_data['total_amount'])} руб\n"
+        f"Админ, решите вручную."
+    )
+    await update.message.reply_text("Жалоба отправлена администратору.")
+
+# ----- Подписка на оператора -----
+async def subscribe_menu(update, context):
+    q = update.callback_query
+    await q.answer()
+    operators = ["МТС", "Билайн", "Мегафон", "Tele2", "Yota"]
+    kb = InlineKeyboardMarkup([[InlineKeyboardButton(op, callback_data=f'sub_{op}')] for op in operators])
+    await q.edit_message_text("Выберите оператора для подписки на новые объявления:", reply_markup=kb)
+
+async def subscribe_callback(update, context):
+    q = update.callback_query
+    await q.answer()
+    op = q.data.replace('sub_', '')
+    uid = q.from_user.id
+    db.add_subscription(uid, op)
+    await q.edit_message_text(f"✅ Вы подписаны на уведомления по оператору {op}")
+
+# ----- Мои объявления и сделки -----
+async def my_offers(update, context):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
     offers = db.get_active_offers()
     mine = [o for o in offers if o['seller_id'] == uid]
     if not mine:
-        await q.edit_message_text("У вас нет активных объявлений")
+        await q.edit_message_text("У вас нет активных объявлений.")
         return
     text = "📋 Ваши объявления:\n"
     for o in mine:
-        text += f"#{o['offer_id']}: {o['amount']} ГБ × {o['price_per_gb']} руб\n"
+        text += f"#{o['offer_id']}: {o['amount']} ГБ × {o['price_per_gb']} руб = {fmt(o['total_price'])} руб | {o['operator']}\n"
     text += "\nОтменить: /cancel_offer [ID]"
     await q.edit_message_text(text)
 
-async def cancel_offer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def cancel_offer_cmd(update, context):
     if not context.args:
         await update.message.reply_text("/cancel_offer [ID]")
         return
@@ -218,196 +364,244 @@ async def cancel_offer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     db.update_gigs(uid, target['amount'])
     db.delete_offer(oid)
-    await update.message.reply_text(f"Объявление #{oid} отменено")
+    await update.message.reply_text(f"Объявление #{oid} отменено, гиги возвращены.")
 
-async def confirm_send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("/confirm_send [ID сделки]")
-        return
-    try:
-        tx = int(context.args[0])
-    except:
-        await update.message.reply_text("ID числом")
-        return
-    uid = update.effective_user.id
-    txn = db.get_transaction(tx)
-    if not txn or txn['seller_id'] != uid or txn['seller_confirmed']:
-        await update.message.reply_text("Не найдено или уже подтверждено")
-        return
-    db.update_transaction_confirmation(tx, seller_confirmed=1)
-    buyer = db.get_user(txn['buyer_id'])
-    await context.bot.send_message(txn['buyer_id'], f"🔔 Продавец подтвердил отправку. /confirm_receive {tx}")
-    await update.message.reply_text("✅ Отправка подтверждена")
-
-async def confirm_receive_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("/confirm_receive [ID сделки]")
-        return
-    try:
-        tx = int(context.args[0])
-    except:
-        await update.message.reply_text("ID числом")
-        return
-    uid = update.effective_user.id
-    txn = db.get_transaction(tx)
-    if not txn or txn['buyer_id'] != uid or txn['buyer_confirmed']:
-        await update.message.reply_text("Не найдено или уже подтверждено")
-        return
-    db.update_transaction_confirmation(tx, buyer_confirmed=1)
-    txn2 = db.get_transaction(tx)
-    if txn2['seller_confirmed']:
-        db.complete_transaction(tx)
-        await context.bot.send_message(txn['seller_id'], f"✅ Покупатель подтвердил получение. Деньги зачислены.")
-        await update.message.reply_text("✅ Сделка завершена")
-    else:
-        await update.message.reply_text("✅ Получение подтверждено. Ждём продавца")
-
-async def confirm_menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def my_deals(update, context):
     q = update.callback_query
     await q.answer()
     uid = q.from_user.id
-    sell = db.get_pending_transactions_for_seller(uid)
-    buy = db.get_pending_transactions_for_buyer(uid)
-    text = "✅ *Ожидают подтверждения:*\n"
-    for t in sell:
-        text += f"Вы продавец: сделка #{t['txn_id']}, {t['amount']} ГБ. /confirm_send {t['txn_id']}\n"
-    for t in buy:
-        text += f"Вы покупатель: сделка #{t['txn_id']}, {t['amount']} ГБ. /confirm_receive {t['txn_id']}\n"
-    if not sell and not buy:
-        text = "Нет сделок на подтверждении"
-    await q.edit_message_text(text, parse_mode="Markdown")
+    # Показываем завершённые сделки
+    conn = sqlite3.connect('giga.db')
+    c = conn.cursor()
+    c.execute("SELECT txn_id, amount, total_amount, status, timestamp FROM transactions WHERE (buyer_id = ? OR seller_id = ?) ORDER BY timestamp DESC LIMIT 10", (uid, uid))
+    rows = c.fetchall()
+    conn.close()
+    if not rows:
+        await q.edit_message_text("У вас нет завершённых сделок.")
+        return
+    text = "📜 Последние сделки:\n"
+    for r in rows:
+        text += f"#{r[0]}: {r[1]} ГБ, {fmt(r[2])} руб, {r[3]}, {r[4][:10]}\n"
+    await q.edit_message_text(text)
 
-async def top_up_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ----- Пополнение и вывод -----
+async def deposit(update, context):
+    q = update.callback_query
+    await q.answer()
+    await q.edit_message_text("💳 Пополнение баланса:\nСейчас доступен демо-режим: /top_up [сумма]\nВ будущем - банковские карты и криптовалюта.")
+
+async def top_up_demo(update, context):
     if not context.args:
-        await update.message.reply_text("/top_up [сумма] (демо-режим)")
+        await update.message.reply_text("/top_up [сумма]")
         return
     try:
         amt = float(context.args[0])
-        if amt <= 0:
-            raise ValueError
+        if amt <= 0: raise ValueError
+        db.update_balance(update.effective_user.id, amt)
+        await update.message.reply_text(f"💰 Баланс пополнен на {fmt(amt)} руб (демо)")
     except:
-        await update.message.reply_text("Сумма должна быть положительным числом")
-        return
-    db.update_balance(update.effective_user.id, amt)
-    await update.message.reply_text(f"💰 Баланс пополнен на {fmt(amt)} руб (демо)")
+        await update.message.reply_text("Сумма должна быть >0")
 
-async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def withdraw_start(update, context):
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text("🔧 Изменить номер: /set_phone")
+    await q.edit_message_text("💰 Введите сумму для вывода (в рублях):")
+    return 1
 
-async def set_phone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    btn = ReplyKeyboardMarkup(
-        [[KeyboardButton("📱 Отправить номер", request_contact=True)]],
-        resize_keyboard=True
+async def withdraw_amount(update, context):
+    try:
+        amount = float(update.message.text)
+        if amount <= 0: raise ValueError
+    except:
+        await update.message.reply_text("Введите положительное число.")
+        return 1
+    uid = update.effective_user.id
+    user = db.get_user(uid)
+    if user['balance'] < amount:
+        await update.message.reply_text(f"Недостаточно средств. У вас {fmt(user['balance'])} руб.")
+        return 1
+    context.user_data['amount'] = amount
+    await update.message.reply_text("Введите реквизиты для вывода (номер карты, кошелёк):")
+    return 2
+
+async def withdraw_details(update, context):
+    details = update.message.text
+    uid = update.effective_user.id
+    amount = context.user_data['amount']
+    req_id = db.add_withdraw_request(uid, amount, details)
+    await context.bot.send_message(
+        ADMIN_ID,
+        f"📨 Заявка на вывод #{req_id}\nПользователь: @{update.effective_user.username} (ID {uid})\nСумма: {fmt(amount)} руб\nРеквизиты: {details}"
     )
-    await update.message.reply_text("Нажмите кнопку, чтобы отправить номер", reply_markup=btn)
-    return PHONE
+    await update.message.reply_text(f"✅ Заявка на вывод #{req_id} отправлена администратору.")
+    return ConversationHandler.END
 
-# === Админ-панель ===
-async def admin_panel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+# ----- Админ-панель -----
+async def admin_menu(update, context):
     q = update.callback_query
     await q.answer()
     if q.from_user.id != ADMIN_ID:
+        await q.edit_message_text("Нет доступа.")
         return
-    kb = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Статистика", callback_data='admin_stats')]])
+    kb = InlineKeyboardMarkup([
+        [InlineKeyboardButton("📊 Статистика", callback_data='admin_stats')],
+        [InlineKeyboardButton("💰 Начислить баланс", callback_data='admin_add_balance')],
+        [InlineKeyboardButton("📦 Начислить гиги", callback_data='admin_add_gigs')],
+        [InlineKeyboardButton("🚫 Чёрный список", callback_data='admin_blacklist')],
+        [InlineKeyboardButton("📋 Заявки на вывод", callback_data='admin_withdraws')],
+    ])
     await q.edit_message_text("👑 Админ-панель", reply_markup=kb)
 
-async def admin_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def admin_stats(update, context):
     q = update.callback_query
     await q.answer()
-    if q.from_user.id != ADMIN_ID:
-        return
+    if q.from_user.id != ADMIN_ID: return
     users = db.get_all_users()
     total_balance = sum(u['balance'] for u in users)
     total_gigs = sum(u['gigs'] for u in users)
     await q.edit_message_text(
-        f"📊 Статистика:\n"
-        f"👥 Пользователей: {len(users)}\n"
+        f"📊 Статистика\n👥 Пользователей: {len(users)}\n"
         f"💰 Общий баланс: {fmt(total_balance)} руб\n"
         f"📦 Всего гигов: {fmt(total_gigs)} ГБ"
     )
 
-async def admin_add_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if len(context.args) != 2:
-        await update.message.reply_text("/admin_add_balance [user_id] [сумма]")
-        return
+async def admin_add_balance_cmd(update, context):
+    if update.effective_user.id != ADMIN_ID: return
+    if len(context.args) != 2: return
     try:
         uid = int(context.args[0])
         amt = float(context.args[1])
         db.update_balance(uid, amt)
-        await update.message.reply_text(f"✅ Пользователю {uid} начислено {fmt(amt)} руб")
-    except:
-        await update.message.reply_text("Ошибка ввода")
+        await update.message.reply_text(f"✅ Начислено {fmt(amt)} руб пользователю {uid}")
+    except: pass
 
-async def admin_add_gigs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID:
-        return
-    if len(context.args) != 2:
-        await update.message.reply_text("/admin_add_gigs [user_id] [ГБ]")
-        return
+async def admin_add_gigs_cmd(update, context):
+    if update.effective_user.id != ADMIN_ID: return
+    if len(context.args) != 2: return
     try:
         uid = int(context.args[0])
-        gb = float(context.args[1])
-        db.update_gigs(uid, gb)
-        await update.message.reply_text(f"✅ Пользователю {uid} начислено {fmt(gb)} ГБ")
-    except:
-        await update.message.reply_text("Ошибка ввода")
+        gigs = float(context.args[1])
+        db.update_gigs(uid, gigs)
+        await update.message.reply_text(f"✅ Начислено {fmt(gigs)} ГБ пользователю {uid}")
+    except: pass
 
-# === ЗАПУСК ===
-async def main():
+async def admin_blacklist(update, context):
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != ADMIN_ID: return
+    await q.edit_message_text("Команды:\n/block_user [ID] [причина]\n/unblock_user [ID]")
+
+async def block_user(update, context):
+    if update.effective_user.id != ADMIN_ID: return
+    if len(context.args) < 2: return
+    try:
+        uid = int(context.args[0])
+        reason = ' '.join(context.args[1:])
+        db.add_to_blacklist(uid, reason, ADMIN_ID)
+        await update.message.reply_text(f"Пользователь {uid} заблокирован. Причина: {reason}")
+    except: pass
+
+async def unblock_user(update, context):
+    if update.effective_user.id != ADMIN_ID: return
+    if not context.args: return
+    try:
+        uid = int(context.args[0])
+        db.remove_from_blacklist(uid)
+        await update.message.reply_text(f"Пользователь {uid} разблокирован.")
+    except: pass
+
+async def admin_withdraws(update, context):
+    q = update.callback_query
+    await q.answer()
+    if q.from_user.id != ADMIN_ID: return
+    reqs = db.get_pending_withdraw_requests()
+    if not reqs:
+        await q.edit_message_text("Нет активных заявок.")
+        return
+    text = "📋 Заявки на вывод:\n"
+    for r in reqs:
+        text += f"#{r['req_id']}: {fmt(r['amount'])} руб от {r['user_id']}\nРеквизиты: {r['details']}\n"
+    text += "\nОдобрить: /approve_withdraw [ID]\nОтклонить: /decline_withdraw [ID]"
+    await q.edit_message_text(text)
+
+async def approve_withdraw(update, context):
+    if update.effective_user.id != ADMIN_ID: return
+    if not context.args: return
+    try:
+        rid = int(context.args[0])
+        db.update_withdraw_request(rid, 'approved')
+        await update.message.reply_text(f"Заявка #{rid} одобрена.")
+    except: pass
+
+async def decline_withdraw(update, context):
+    if update.effective_user.id != ADMIN_ID: return
+    if not context.args: return
+    try:
+        rid = int(context.args[0])
+        db.update_withdraw_request(rid, 'declined')
+        await update.message.reply_text(f"Заявка #{rid} отклонена.")
+    except: pass
+
+# ----- Запуск -----
+def main():
     app = Application.builder().token(TOKEN).build()
 
-    conv_phone = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            PHONE: [MessageHandler(filters.CONTACT, receive_contact)],
-            OPERATOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, receive_operator_text)],
-        },
-        fallbacks=[],
-    )
-    conv_sell = ConversationHandler(
-        entry_points=[CallbackQueryHandler(sell_menu, pattern='^sell_menu$')],
-        states={
-            SELL_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_amount)],
-            SELL_PRICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_price)],
-            SELL_OPERATOR: [CallbackQueryHandler(sell_operator, pattern='^sell_op_')],
-        },
-        fallbacks=[],
-    )
-
-    app.add_handler(conv_phone)
-    app.add_handler(conv_sell)
-    app.add_handler(CommandHandler("top_up", top_up_cmd))
+    # Регистрация команд
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("top_up", top_up_demo))
     app.add_handler(CommandHandler("buy_offer", buy_offer_cmd))
     app.add_handler(CommandHandler("cancel_offer", cancel_offer_cmd))
     app.add_handler(CommandHandler("confirm_send", confirm_send_cmd))
     app.add_handler(CommandHandler("confirm_receive", confirm_receive_cmd))
-    app.add_handler(CommandHandler("set_phone", set_phone_cmd))
+    app.add_handler(CommandHandler("rate_seller", rate_seller))
+    app.add_handler(CommandHandler("dispute", dispute))
+    app.add_handler(CommandHandler("block_user", block_user))
+    app.add_handler(CommandHandler("unblock_user", unblock_user))
     app.add_handler(CommandHandler("admin_add_balance", admin_add_balance_cmd))
     app.add_handler(CommandHandler("admin_add_gigs", admin_add_gigs_cmd))
+    app.add_handler(CommandHandler("approve_withdraw", approve_withdraw))
+    app.add_handler(CommandHandler("decline_withdraw", decline_withdraw))
 
-    app.add_handler(CallbackQueryHandler(balance_cmd, pattern='^balance$'))
-    app.add_handler(CallbackQueryHandler(buy_list, pattern='^buy$'))
-    app.add_handler(CallbackQueryHandler(my_offers_cmd, pattern='^my_offers$'))
-    app.add_handler(CallbackQueryHandler(settings_cmd, pattern='^settings$'))
-    app.add_handler(CallbackQueryHandler(confirm_menu_cmd, pattern='^confirm_menu$'))
-    app.add_handler(CallbackQueryHandler(admin_panel_cmd, pattern='^admin_panel$'))
-    app.add_handler(CallbackQueryHandler(admin_stats_cmd, pattern='^admin_stats$'))
+    # Продажа (Conversation)
+    sell_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(sell_menu, pattern='^sell_menu$')],
+        states={
+            1: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_amount)],
+            2: [MessageHandler(filters.TEXT & ~filters.COMMAND, sell_price)],
+        },
+        fallbacks=[],
+    )
+    # Вывод
+    withdraw_conv = ConversationHandler(
+        entry_points=[CallbackQueryHandler(withdraw_start, pattern='^withdraw_start$')],
+        states={
+            1: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_amount)],
+            2: [MessageHandler(filters.TEXT & ~filters.COMMAND, withdraw_details)],
+        },
+        fallbacks=[],
+    )
+    app.add_handler(sell_conv)
+    app.add_handler(withdraw_conv)
 
-    print("🚀 GIGA BAR запущен")
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling()
-    try:
-        while True:
-            await asyncio.sleep(1)
-    except KeyboardInterrupt:
-        await app.updater.stop()
-        await app.stop()
-        await app.shutdown()
+    # Callback'и
+    app.add_handler(CallbackQueryHandler(balance_callback, pattern='^balance$'))
+    app.add_handler(CallbackQueryHandler(my_gigs_callback, pattern='^my_gigs$'))
+    app.add_handler(CallbackQueryHandler(buy_list, pattern='^buy_list$'))
+    app.add_handler(CallbackQueryHandler(my_offers, pattern='^my_offers$'))
+    app.add_handler(CallbackQueryHandler(my_deals, pattern='^my_deals$'))
+    app.add_handler(CallbackQueryHandler(deposit, pattern='^deposit$'))
+    app.add_handler(CallbackQueryHandler(subscribe_menu, pattern='^subscribe$'))
+    app.add_handler(CallbackQueryHandler(subscribe_callback, pattern='^sub_'))
+    app.add_handler(CallbackQueryHandler(admin_menu, pattern='^admin_menu$'))
+    app.add_handler(CallbackQueryHandler(admin_stats, pattern='^admin_stats$'))
+    app.add_handler(CallbackQueryHandler(admin_blacklist, pattern='^admin_blacklist$'))
+    app.add_handler(CallbackQueryHandler(admin_withdraws, pattern='^admin_withdraws$'))
+    # Заглушки для кнопок-заглушек
+    app.add_handler(CallbackQueryHandler(lambda u,c: u.callback_query.answer(), pattern='^admin_add_balance$'))
+    app.add_handler(CallbackQueryHandler(lambda u,c: u.callback_query.answer(), pattern='^admin_add_gigs$'))
+
+    print("🚀 GIGA BAR (гарант) запущен")
+    app.run_polling()
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
