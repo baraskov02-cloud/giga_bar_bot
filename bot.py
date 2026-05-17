@@ -1,5 +1,6 @@
 import logging
 import asyncio
+import sqlite3
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, CallbackQueryHandler, ContextTypes,
@@ -69,7 +70,6 @@ async def start(update, context):
     if db.is_blacklisted(user.id):
         await update.message.reply_text("⛔ Вы в чёрном списке. Обратитесь к администратору.")
         return
-    # Если нет телефона и оператора, предложим ввести
     if not db.get_user(user.id)['phone']:
         await update.message.reply_text(
             "Добро пожаловать в GIGA BAR!\n"
@@ -100,6 +100,7 @@ async def receive_operator(update, context):
     uid = update.effective_user.id
     db.update_user_phone(uid, context.user_data['phone'], op)
     await update.message.reply_text(f"✅ Номер {context.user_data['phone']} и оператор {op} сохранены.")
+    # Показываем главное меню
     await main_menu(update, uid, message=update.message)
     return ConversationHandler.END
 
@@ -159,7 +160,6 @@ async def sell_price(update, context):
     db.update_gigs(uid, -amount)
     oid = db.add_offer(uid, amount, price, user['operator'])
     await update.message.reply_text(f"✅ Объявление #{oid} создано!\n{amount} ГБ по {price} руб/ГБ, итого {fmt(total)} руб")
-    # Уведомить подписчиков
     subscribers = db.get_subscribers_by_operator(user['operator'])
     for sub in subscribers:
         if sub != uid:
@@ -237,7 +237,7 @@ async def buy_offer_cmd(update, context):
         parse_mode='Markdown'
     )
 
-# ----- Подтверждение -----
+# ----- Подтверждение сделок -----
 async def confirm_send_cmd(update, context):
     if not context.args:
         await update.message.reply_text("/confirm_send [ID сделки]")
@@ -559,7 +559,7 @@ async def decline_withdraw(update, context):
         await update.message.reply_text(f"Заявка #{rid} отклонена.")
     except: pass
 
-# ----- ЗАПУСК -----
+# ========== ЗАПУСК ==========
 def main():
     app = Application.builder().token(TOKEN).build()
 
@@ -621,7 +621,7 @@ def main():
     app.add_handler(CallbackQueryHandler(admin_stats, pattern='^admin_stats$'))
     app.add_handler(CallbackQueryHandler(admin_blacklist, pattern='^admin_blacklist$'))
     app.add_handler(CallbackQueryHandler(admin_withdraws, pattern='^admin_withdraws$'))
-    # заглушки
+    # заглушки для кнопок, которые не имеют отдельных обработчиков
     app.add_handler(CallbackQueryHandler(lambda u,c: u.callback_query.answer(), pattern='^admin_add_balance$'))
     app.add_handler(CallbackQueryHandler(lambda u,c: u.callback_query.answer(), pattern='^admin_add_gigs$'))
 
