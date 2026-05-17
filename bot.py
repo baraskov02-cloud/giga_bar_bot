@@ -1,6 +1,5 @@
 import logging
 import asyncio
-import os
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup, KeyboardButton
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, filters,
@@ -8,14 +7,12 @@ from telegram.ext import (
 )
 import database as db
 
-# === НАСТРОЙКИ ===
 TOKEN = "8657499967:AAFq4WDXDCMCHyABu5Y7AeXMWSc8q7yZVQA"
 ADMIN_ID = 6665494648
 COMMISSION_PERCENT = 5.0
 MAX_GB_PER_TRADE = 100
 OPERATORS = ['МТС', 'Билайн', 'Мегафон', 'Tele2', 'Yota']
 
-# === СОСТОЯНИЯ ДЛЯ РАЗГОВОРОВ ===
 PHONE, OPERATOR, SELL_AMOUNT, SELL_PRICE, SELL_OPERATOR = range(5)
 
 logging.basicConfig(level=logging.INFO)
@@ -37,14 +34,14 @@ async def main_menu(message, user_id):
         [InlineKeyboardButton("⚙️ Настройки", callback_data='settings')],
     ]
     if user['user_id'] == ADMIN_ID:
-        keyboard.append([InlineKeyboardButton("👑 Админ-панель", callback_data='admin_panel')])
-    
+        keyboard.append([InlineKeyboardButton("👑 Админ", callback_data='admin_panel')])
+
     await message.reply_text(
-        f"🏪 *GIGA BAR — биржа гигабайт*\n\n"
+        f"🏪 *GIGA BAR*\n\n"
         f"💰 Баланс: `{fmt(user['balance'])}` руб\n"
         f"📦 Гиги: `{fmt(user['gigs'])}` ГБ\n"
-        f"📱 Телефон: `{user['phone'] or 'не указан'}`\n"
-        f"📡 Оператор: `{user['operator'] or 'не указан'}`\n\n"
+        f"📱 Телефон: `{user['phone'] or '—'}`\n"
+        f"📡 Оператор: `{user['operator'] or '—'}`\n\n"
         f"💸 Комиссия: {COMMISSION_PERCENT}%",
         reply_markup=keyboard,
         parse_mode="Markdown"
@@ -53,7 +50,7 @@ async def main_menu(message, user_id):
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.effective_user
     db.register_user(user.id, user.username)
-    
+
     if not db.get_user(user.id)['phone']:
         btn = ReplyKeyboardMarkup(
             [[KeyboardButton("📱 Отправить номер", request_contact=True)]],
@@ -64,6 +61,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
             reply_markup=btn
         )
         return PHONE
+
     await main_menu(update.message, user.id)
     return ConversationHandler.END
 
@@ -74,7 +72,7 @@ async def receive_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return PHONE
     db.update_user_phone(update.effective_user.id, contact.phone_number, None)
     await update.message.reply_text(
-        "Теперь выберите оператора:",
+        "Выберите оператора:",
         reply_markup=ReplyKeyboardMarkup([[op for op in OPERATORS]], resize_keyboard=True)
     )
     return OPERATOR
@@ -82,7 +80,7 @@ async def receive_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def receive_operator_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     op = update.message.text
     if op not in OPERATORS:
-        await update.message.reply_text(f"Выберите из списка: {', '.join(OPERATORS)}")
+        await update.message.reply_text(f"Выберите из: {', '.join(OPERATORS)}")
         return OPERATOR
     uid = update.effective_user.id
     user = db.get_user(uid)
@@ -118,9 +116,10 @@ async def sell_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def sell_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         p = float(update.message.text)
-        if p <= 0: raise ValueError
+        if p <= 0:
+            raise ValueError
     except:
-        await update.message.reply_text("Число >0")
+        await update.message.reply_text("Введите положительное число")
         return SELL_PRICE
     context.user_data['price'] = p
     kb = InlineKeyboardMarkup([[InlineKeyboardButton(op, callback_data=f'sell_op_{op}') for op in OPERATORS]])
@@ -163,7 +162,7 @@ async def buy_offer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         oid = int(context.args[0])
     except:
-        await update.message.reply_text("ID числом")
+        await update.message.reply_text("ID должно быть числом")
         return
     buyer = update.effective_user.id
     offer = db.get_offer_by_id(oid)
@@ -177,11 +176,10 @@ async def buy_offer_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if buyer_data['balance'] < offer['total_price']:
         await update.message.reply_text(f"Не хватает {fmt(offer['total_price'])} руб. /top_up")
         return
-    comm = offer['total_price'] * COMMISSION_PERCENT / 100
-    tx = db.add_transaction(buyer, offer['seller_id'], offer['amount'], offer['price_per_gb'], offer['total_price'], comm)
+    commission = offer['total_price'] * COMMISSION_PERCENT / 100
+    tx = db.add_transaction(buyer, offer['seller_id'], offer['amount'], offer['price_per_gb'], offer['total_price'], commission)
     db.update_balance(buyer, -offer['total_price'])
     db.delete_offer(oid)
-    seller_data = db.get_user(offer['seller_id'])
     await context.bot.send_message(
         offer['seller_id'],
         f"🔔 Сделка #{tx}!\nПередайте {offer['amount']} ГБ на {buyer_data['phone']}\nПосле отправки: /confirm_send {tx}"
@@ -239,7 +237,7 @@ async def confirm_send_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     db.update_transaction_confirmation(tx, seller_confirmed=1)
     buyer = db.get_user(txn['buyer_id'])
     await context.bot.send_message(txn['buyer_id'], f"🔔 Продавец подтвердил отправку. /confirm_receive {tx}")
-    await update.message.reply_text("✅ Подтверждено")
+    await update.message.reply_text("✅ Отправка подтверждена")
 
 async def confirm_receive_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
@@ -259,7 +257,6 @@ async def confirm_receive_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
     txn2 = db.get_transaction(tx)
     if txn2['seller_confirmed']:
         db.complete_transaction(tx)
-        seller = db.get_user(txn['seller_id'])
         await context.bot.send_message(txn['seller_id'], f"✅ Покупатель подтвердил получение. Деньги зачислены.")
         await update.message.reply_text("✅ Сделка завершена")
     else:
@@ -282,21 +279,22 @@ async def confirm_menu_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def top_up_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
-        await update.message.reply_text("/top_up [сумма] (демо)")
+        await update.message.reply_text("/top_up [сумма] (демо-режим)")
         return
     try:
         amt = float(context.args[0])
-        if amt <= 0: raise ValueError
+        if amt <= 0:
+            raise ValueError
     except:
-        await update.message.reply_text("Сумма >0")
+        await update.message.reply_text("Сумма должна быть положительным числом")
         return
     db.update_balance(update.effective_user.id, amt)
-    await update.message.reply_text(f"💰 Пополнено на {fmt(amt)} руб (демо)")
+    await update.message.reply_text(f"💰 Баланс пополнен на {fmt(amt)} руб (демо)")
 
 async def settings_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    await q.edit_message_text("Изменить номер: /set_phone")
+    await q.edit_message_text("🔧 Изменить номер: /set_phone")
 
 async def set_phone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     btn = ReplyKeyboardMarkup(
@@ -306,46 +304,62 @@ async def set_phone_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Нажмите кнопку, чтобы отправить номер", reply_markup=btn)
     return PHONE
 
-# === АДМИН-ПАНЕЛЬ ===
+# === Админ-панель ===
 async def admin_panel_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if q.from_user.id != ADMIN_ID: return
+    if q.from_user.id != ADMIN_ID:
+        return
     kb = InlineKeyboardMarkup([[InlineKeyboardButton("📊 Статистика", callback_data='admin_stats')]])
     await q.edit_message_text("👑 Админ-панель", reply_markup=kb)
 
 async def admin_stats_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
-    if q.from_user.id != ADMIN_ID: return
+    if q.from_user.id != ADMIN_ID:
+        return
     users = db.get_all_users()
-    bal = sum(u['balance'] for u in users)
-    await q.edit_message_text(f"👥 Пользователей: {len(users)}\n💰 Общий баланс: {fmt(bal)} руб")
+    total_balance = sum(u['balance'] for u in users)
+    total_gigs = sum(u['gigs'] for u in users)
+    await q.edit_message_text(
+        f"📊 Статистика:\n"
+        f"👥 Пользователей: {len(users)}\n"
+        f"💰 Общий баланс: {fmt(total_balance)} руб\n"
+        f"📦 Всего гигов: {fmt(total_gigs)} ГБ"
+    )
 
 async def admin_add_balance_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    if len(context.args) != 2: return
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if len(context.args) != 2:
+        await update.message.reply_text("/admin_add_balance [user_id] [сумма]")
+        return
     try:
         uid = int(context.args[0])
         amt = float(context.args[1])
         db.update_balance(uid, amt)
-        await update.message.reply_text(f"✅ {fmt(amt)} руб → {uid}")
-    except: pass
+        await update.message.reply_text(f"✅ Пользователю {uid} начислено {fmt(amt)} руб")
+    except:
+        await update.message.reply_text("Ошибка ввода")
 
 async def admin_add_gigs_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if update.effective_user.id != ADMIN_ID: return
-    if len(context.args) != 2: return
+    if update.effective_user.id != ADMIN_ID:
+        return
+    if len(context.args) != 2:
+        await update.message.reply_text("/admin_add_gigs [user_id] [ГБ]")
+        return
     try:
         uid = int(context.args[0])
         gb = float(context.args[1])
         db.update_gigs(uid, gb)
-        await update.message.reply_text(f"✅ {fmt(gb)} ГБ → {uid}")
-    except: pass
+        await update.message.reply_text(f"✅ Пользователю {uid} начислено {fmt(gb)} ГБ")
+    except:
+        await update.message.reply_text("Ошибка ввода")
 
 # === ЗАПУСК ===
 async def main():
     app = Application.builder().token(TOKEN).build()
-    
+
     conv_phone = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -363,6 +377,7 @@ async def main():
         },
         fallbacks=[],
     )
+
     app.add_handler(conv_phone)
     app.add_handler(conv_sell)
     app.add_handler(CommandHandler("top_up", top_up_cmd))
@@ -373,6 +388,7 @@ async def main():
     app.add_handler(CommandHandler("set_phone", set_phone_cmd))
     app.add_handler(CommandHandler("admin_add_balance", admin_add_balance_cmd))
     app.add_handler(CommandHandler("admin_add_gigs", admin_add_gigs_cmd))
+
     app.add_handler(CallbackQueryHandler(balance_cmd, pattern='^balance$'))
     app.add_handler(CallbackQueryHandler(buy_list, pattern='^buy$'))
     app.add_handler(CallbackQueryHandler(my_offers_cmd, pattern='^my_offers$'))
@@ -380,7 +396,7 @@ async def main():
     app.add_handler(CallbackQueryHandler(confirm_menu_cmd, pattern='^confirm_menu$'))
     app.add_handler(CallbackQueryHandler(admin_panel_cmd, pattern='^admin_panel$'))
     app.add_handler(CallbackQueryHandler(admin_stats_cmd, pattern='^admin_stats$'))
-    
+
     print("🚀 GIGA BAR запущен")
     await app.initialize()
     await app.start()
