@@ -34,7 +34,32 @@ def init_db():
                   status TEXT DEFAULT 'pending',
                   buyer_confirmed INTEGER DEFAULT 0,
                   seller_confirmed INTEGER DEFAULT 0,
+                  dispute INTEGER DEFAULT 0,
                   timestamp TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS ratings
+                 (rating_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  from_user INTEGER,
+                  to_user INTEGER,
+                  txn_id INTEGER,
+                  rating INTEGER,
+                  comment TEXT,
+                  timestamp TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS blacklist
+                 (user_id INTEGER PRIMARY KEY,
+                  reason TEXT,
+                  admin_id INTEGER,
+                  created_at TEXT)''')
+    c.execute('''CREATE TABLE IF NOT EXISTS subscriptions
+                 (user_id INTEGER,
+                  operator TEXT,
+                  PRIMARY KEY (user_id, operator))''')
+    c.execute('''CREATE TABLE IF NOT EXISTS withdraw_requests
+                 (req_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                  user_id INTEGER,
+                  amount REAL,
+                  details TEXT,
+                  status TEXT DEFAULT 'pending',
+                  created_at TEXT)''')
     conn.commit()
     conn.close()
 
@@ -62,10 +87,10 @@ def get_user(user_id):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    user = c.fetchone()
+    row = c.fetchone()
     conn.close()
-    if user:
-        return {'user_id': user[0], 'username': user[1], 'phone': user[2], 'operator': user[3], 'balance': user[4], 'gigs': user[5]}
+    if row:
+        return {'user_id': row[0], 'username': row[1], 'phone': row[2], 'operator': row[3], 'balance': row[4], 'gigs': row[5]}
     return None
 
 def get_all_users():
@@ -113,10 +138,10 @@ def get_offer_by_id(offer_id):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
     c.execute("SELECT offer_id, seller_id, amount, price_per_gb, total_price, operator FROM offers WHERE offer_id = ? AND status = 'active'", (offer_id,))
-    offer = c.fetchone()
+    row = c.fetchone()
     conn.close()
-    if offer:
-        return {'offer_id': offer[0], 'seller_id': offer[1], 'amount': offer[2], 'price_per_gb': offer[3], 'total_price': offer[4], 'operator': offer[5]}
+    if row:
+        return {'offer_id': row[0], 'seller_id': row[1], 'amount': row[2], 'price_per_gb': row[3], 'total_price': row[4], 'operator': row[5]}
     return None
 
 def delete_offer(offer_id):
@@ -136,18 +161,15 @@ def add_transaction(buyer_id, seller_id, amount, price_per_gb, total_amount, com
     conn.close()
     return txn_id
 
-def update_transaction_confirmation(txn_id, buyer_confirmed=None, seller_confirmed=None):
+def update_transaction_confirmation(txn_id, buyer_confirmed=None, seller_confirmed=None, dispute=0):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    updates = []
     if buyer_confirmed is not None:
-        updates.append(f"buyer_confirmed = {buyer_confirmed}")
+        c.execute("UPDATE transactions SET buyer_confirmed = ? WHERE txn_id = ?", (buyer_confirmed, txn_id))
     if seller_confirmed is not None:
-        updates.append(f"seller_confirmed = {seller_confirmed}")
-    if updates:
-        query = f"UPDATE transactions SET {', '.join(updates)} WHERE txn_id = ?"
-        c.execute(query, (txn_id,))
-    # Если оба подтвердили — меняем статус
+        c.execute("UPDATE transactions SET seller_confirmed = ? WHERE txn_id = ?", (seller_confirmed, txn_id))
+    if dispute:
+        c.execute("UPDATE transactions SET dispute = ? WHERE txn_id = ?", (dispute, txn_id))
     c.execute("SELECT buyer_confirmed, seller_confirmed FROM transactions WHERE txn_id = ?", (txn_id,))
     buyer_c, seller_c = c.fetchone()
     if buyer_c == 1 and seller_c == 1:
@@ -174,11 +196,11 @@ def get_pending_transactions_for_buyer(buyer_id):
 def get_transaction(txn_id):
     conn = sqlite3.connect(DB_NAME)
     c = conn.cursor()
-    c.execute("SELECT txn_id, buyer_id, seller_id, amount, price_per_gb, total_amount, commission, status, buyer_confirmed, seller_confirmed FROM transactions WHERE txn_id = ?", (txn_id,))
+    c.execute("SELECT txn_id, buyer_id, seller_id, amount, price_per_gb, total_amount, commission, status, buyer_confirmed, seller_confirmed, dispute FROM transactions WHERE txn_id = ?", (txn_id,))
     row = c.fetchone()
     conn.close()
     if row:
-        return {'txn_id': row[0], 'buyer_id': row[1], 'seller_id': row[2], 'amount': row[3], 'price_per_gb': row[4], 'total_amount': row[5], 'commission': row[6], 'status': row[7], 'buyer_confirmed': row[8], 'seller_confirmed': row[9]}
+        return {'txn_id': row[0], 'buyer_id': row[1], 'seller_id': row[2], 'amount': row[3], 'price_per_gb': row[4], 'total_amount': row[5], 'commission': row[6], 'status': row[7], 'buyer_confirmed': row[8], 'seller_confirmed': row[9], 'dispute': row[10]}
     return None
 
 def complete_transaction(txn_id):
@@ -189,9 +211,93 @@ def complete_transaction(txn_id):
     if row:
         buyer_id, seller_id, amount, total_amount, commission = row
         seller_gets = total_amount - commission
-        # Переводим деньги продавцу
         c.execute("UPDATE users SET balance = balance + ? WHERE user_id = ?", (seller_gets, seller_id))
-        # Обновляем статус транзакции
         c.execute("UPDATE transactions SET status = 'completed' WHERE txn_id = ?", (txn_id,))
         conn.commit()
+    conn.close()
+
+def add_rating(from_user, to_user, txn_id, rating, comment):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT INTO ratings (from_user, to_user, txn_id, rating, comment, timestamp) VALUES (?, ?, ?, ?, ?, ?)",
+              (from_user, to_user, txn_id, rating, comment, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def get_avg_rating(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT AVG(rating) FROM ratings WHERE to_user = ?", (user_id,))
+    avg = c.fetchone()[0]
+    conn.close()
+    return avg if avg else 0.0
+
+def is_blacklisted(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT 1 FROM blacklist WHERE user_id = ?", (user_id,))
+    res = c.fetchone()
+    conn.close()
+    return res is not None
+
+def add_to_blacklist(user_id, reason, admin_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT OR REPLACE INTO blacklist (user_id, reason, admin_id, created_at) VALUES (?, ?, ?, ?)",
+              (user_id, reason, admin_id, datetime.now().isoformat()))
+    conn.commit()
+    conn.close()
+
+def remove_from_blacklist(user_id):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("DELETE FROM blacklist WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+def add_subscription(user_id, operator):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT OR IGNORE INTO subscriptions (user_id, operator) VALUES (?, ?)", (user_id, operator))
+    conn.commit()
+    conn.close()
+
+def remove_subscription(user_id, operator):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("DELETE FROM subscriptions WHERE user_id = ? AND operator = ?", (user_id, operator))
+    conn.commit()
+    conn.close()
+
+def get_subscribers_by_operator(operator):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT user_id FROM subscriptions WHERE operator = ?", (operator,))
+    rows = c.fetchall()
+    conn.close()
+    return [r[0] for r in rows]
+
+def add_withdraw_request(user_id, amount, details):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("INSERT INTO withdraw_requests (user_id, amount, details, created_at) VALUES (?, ?, ?, ?)",
+              (user_id, amount, details, datetime.now().isoformat()))
+    req_id = c.lastrowid
+    conn.commit()
+    conn.close()
+    return req_id
+
+def get_pending_withdraw_requests():
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("SELECT req_id, user_id, amount, details, created_at FROM withdraw_requests WHERE status = 'pending'")
+    rows = c.fetchall()
+    conn.close()
+    return [{'req_id': r[0], 'user_id': r[1], 'amount': r[2], 'details': r[3], 'created_at': r[4]} for r in rows]
+
+def update_withdraw_request(req_id, status):
+    conn = sqlite3.connect(DB_NAME)
+    c = conn.cursor()
+    c.execute("UPDATE withdraw_requests SET status = ? WHERE req_id = ?", (status, req_id))
+    conn.commit()
     conn.close()
