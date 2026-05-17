@@ -21,29 +21,11 @@ logger = logging.getLogger(__name__)
 
 db.init_db()
 
-# ========== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ==========
 def get_user_link(user_id):
     return f"[Пользователь](tg://user?id={user_id})"
 
 def format_number(n):
     return f"{n:.2f}"
-
-# ========== КОМАНДЫ ==========
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user = update.effective_user
-    db.register_user(user.id, user.username)
-    
-    # Проверяем, есть ли у пользователя телефон
-    user_data = db.get_user(user.id)
-    if not user_data['phone']:
-        await update.message.reply_text(
-            f"Добро пожаловать в GIGA BAR, {user.first_name}!\n\n"
-            "🔐 Для работы с биржей нужно указать номер телефона и оператора.\n"
-            "Отправьте ваш номер телефона (например: 79123456789)"
-        )
-        return PHONE
-    
-    await show_main_menu(update.message, user.id)
 
 async def show_main_menu(message, user_id):
     user = db.get_user(user_id)
@@ -68,6 +50,21 @@ async def show_main_menu(message, user_id):
         f"Комиссия биржи: {COMMISSION_PERCENT}%",
         reply_markup=reply_markup
     )
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    db.register_user(user.id, user.username)
+    
+    user_data = db.get_user(user.id)
+    if not user_data['phone']:
+        await update.message.reply_text(
+            f"Добро пожаловать в GIGA BAR, {user.first_name}!\n\n"
+            "🔐 Для работы с биржей нужно указать номер телефона и оператора.\n"
+            "Отправьте ваш номер телефона (например: 79123456789)"
+        )
+        return PHONE
+    
+    await show_main_menu(update.message, user.id)
 
 async def balance_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
@@ -114,7 +111,7 @@ async def sell_price(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     context.user_data['sell_price'] = price
     await update.message.reply_text(
-        f"Выберите оператора:\n" + "\n".join([f"{i+1}. {op}" for i, op in enumerate(OPERATORS)]),
+        f"Выберите оператора:",
         reply_markup=InlineKeyboardMarkup([
             [InlineKeyboardButton(op, callback_data=f'sell_op_{op}') for op in OPERATORS]
         ])
@@ -130,13 +127,11 @@ async def sell_operator(update: Update, context: ContextTypes.DEFAULT_TYPE):
     price = context.user_data['sell_price']
     total = amount * price
     
-    # Проверяем, есть ли гиги у продавца
     user = db.get_user(user_id)
     if user['gigs'] < amount:
         await query.edit_message_text(f"У вас только {format_number(user['gigs'])} ГБ. Недостаточно!")
         return ConversationHandler.END
     
-    # Создаём предложение
     db.update_gigs(user_id, -amount)
     offer_id = db.add_offer(user_id, amount, price, operator)
     
@@ -189,19 +184,14 @@ async def buy_offer_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(f"Недостаточно средств. Нужно {format_number(offer['total_price'])} руб.\nПополните баланс: /top_up [сумма]")
         return
     
-    # Создаём транзакцию
     commission = offer['total_price'] * COMMISSION_PERCENT / 100
     txn_id = db.add_transaction(buyer_id, offer['seller_id'], offer['amount'], offer['price_per_gb'], offer['total_price'], commission)
     
-    # Списываем деньги у покупателя
     db.update_balance(buyer_id, -offer['total_price'])
-    
-    # Удаляем предложение
     db.delete_offer(offer_id)
     
     seller = db.get_user(offer['seller_id'])
     
-    # Уведомляем продавца
     await context.bot.send_message(
         offer['seller_id'],
         f"🔔 У вас новая сделка #{txn_id}!\n"
@@ -279,7 +269,6 @@ async def confirm_send(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     db.update_transaction_confirmation(txn_id, seller_confirmed=1)
     
-    # Уведомляем покупателя
     buyer = db.get_user(txn['buyer_id'])
     await context.bot.send_message(
         txn['buyer_id'],
@@ -312,7 +301,6 @@ async def confirm_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     db.update_transaction_confirmation(txn_id, buyer_confirmed=1)
     
-    # Если продавец тоже подтвердил — завершаем сделку
     txn_updated = db.get_transaction(txn_id)
     if txn_updated['seller_confirmed'] == 1:
         db.complete_transaction(txn_id)
@@ -326,13 +314,41 @@ async def confirm_receive(update: Update, context: ContextTypes.DEFAULT_TYPE):
             txn['seller_id'],
             f"✅ Покупатель подтвердил получение {txn['amount']} ГБ!\n"
             f"💰 {format_number(txn['total_amount'] - txn['commission'])} руб зачислены на ваш баланс.\n"
-            f"Вывести: /withdraw"
+            f"Вывести: /withdraw (в разработке)"
         )
     else:
         await update.message.reply_text(
             f"✅ Вы подтвердили получение по сделке #{txn_id}.\n"
             f"Ожидаем, когда продавец подтвердит отправку."
         )
+
+async def confirm_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    user_id = query.from_user.id
+    
+    # Показываем ожидающие сделки
+    as_seller = db.get_pending_transactions_for_seller(user_id)
+    as_buyer = db.get_pending_transactions_for_buyer(user_id)
+    
+    text = "✅ ПОДТВЕРЖДЕНИЕ СДЕЛОК\n\n"
+    
+    if as_seller:
+        text += "📤 Вы продавец (подтвердите отправку):\n"
+        for t in as_seller:
+            text += f"Сделка #{t['txn_id']}: {t['amount']} ГБ, сумма {format_number(t['total_amount'])} руб\n"
+            text += f"/confirm_send {t['txn_id']}\n\n"
+    
+    if as_buyer:
+        text += "📥 Вы покупатель (подтвердите получение):\n"
+        for t in as_buyer:
+            text += f"Сделка #{t['txn_id']}: {t['amount']} ГБ, сумма {format_number(t['total_amount'])} руб\n"
+            text += f"/confirm_receive {t['txn_id']}\n\n"
+    
+    if not as_seller and not as_buyer:
+        text += "Нет активных сделок, ожидающих подтверждения."
+    
+    await query.edit_message_text(text)
 
 async def top_up(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not context.args:
